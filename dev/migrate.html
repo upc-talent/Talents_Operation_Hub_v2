@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Data migration — Apps Script → Supabase</title>
+<style>
+  body{font-family:system-ui,Segoe UI,Arial,sans-serif;max-width:760px;margin:32px auto;padding:0 18px;color:#12233f;}
+  h1{font-size:20px;} p{font-size:13px;line-height:1.6;color:#333;}
+  .card{border:1px solid #d8e0ea;border-radius:10px;padding:16px;margin:14px 0;background:#fbfdff;}
+  label{display:block;font-size:12px;font-weight:700;margin:8px 0 3px;}
+  input{width:100%;padding:8px 10px;border:1px solid #cbd5e1;border-radius:7px;font-size:13px;box-sizing:border-box;}
+  button{margin-top:14px;background:#003261;color:#fff;border:0;padding:10px 18px;border-radius:8px;font-weight:700;font-size:13px;cursor:pointer;}
+  button:disabled{opacity:.5;cursor:default;}
+  pre{background:#0b1b30;color:#d7e6ff;padding:12px;border-radius:8px;font-size:12px;white-space:pre-wrap;max-height:340px;overflow:auto;}
+  .warn{background:#fff7e6;border-color:#f0c674;}
+</style>
+</head>
+<body>
+<h1>Data migration → Supabase</h1>
+<p>This copies everything from the <b>current Google Apps Script</b> backend into <b>Supabase</b>. It's safe to
+run more than once (records are upserted by id). Do <b>Steps 1–3</b> in <code>supabase/README.md</code> first
+(schema, secrets, deploy the function).</p>
+
+<div class="card warn">
+  <p style="margin:0;"><b>Before you run it:</b> the trainer login you type below is used for <i>both</i> backends,
+  so set the same <code>TRAINER_USER</code> / <code>TRAINER_PASS</code> on Supabase as you use today.</p>
+</div>
+
+<div class="card">
+  <label>Trainer username</label>
+  <input type="text" id="u" autocomplete="username">
+  <label>Trainer password</label>
+  <input type="password" id="p" autocomplete="current-password">
+  <button id="go" onclick="run()">Start migration</button>
+</div>
+
+<pre id="log">Ready.</pre>
+
+<script src="../assets/js/config.js"></script>
+<script src="../assets/js/api.js"></script>
+<script>
+const logEl = document.getElementById('log');
+function log(m){ logEl.textContent += '\n' + m; logEl.scrollTop = logEl.scrollHeight; }
+const CFG = window.APP_CONFIG;
+const GAS = { url: 'https://script.google.com/macros/s/AKfycbxbLEHU-uRJhHtd9yT2nqiFi6trJEyvNS8zxKNkALhY_deI5U9VlrKF5AJJUsbPvSyU/exec', kind: 'gas' };
+const SB  = { url: CFG.SUPABASE_URL.replace(/\/$/, '') + '/functions/v1/api', kind: 'supabase' };
+
+function useBackend(b){ CFG.API_URL = b.url; CFG.API_KIND = b.kind; }
+const chunks = (obj, n) => { const ks = Object.keys(obj), out = []; for(let i=0;i<ks.length;i+=n){ const c={}; ks.slice(i,i+n).forEach(k=>c[k]=obj[k]); out.push(c); } return out; };
+const toMap = (arr) => Object.fromEntries((arr||[]).map(x => [x.id, x]));
+
+async function run(){
+  const btn = document.getElementById('go'); btn.disabled = true;
+  logEl.textContent = 'Starting…';
+  const user = document.getElementById('u').value.trim();
+  const pass = document.getElementById('p').value;
+  try{
+    /* ---------- READ from Apps Script ---------- */
+    useBackend(GAS);
+    API.init('trainer'); API.clearToken();
+    log('Signing in to Google Apps Script…');
+    await API.login(user, pass);
+    log('Reading data…');
+    const many = await getSharedMany(
+      ['master-pharmacists','training-config','operations','pending-pharmacists','leave-requests','quota-approval-history','pharmacist-notifications'], {});
+    const logo = await getShared('company-logo', null);
+
+    const master = many['master-pharmacists'] || [];
+    const cfg = many['training-config'] || {};
+    const ops = many['operations'] || {assignments:{}, attendance:{}};
+    const pending = many['pending-pharmacists'] || [];
+    const leave = many['leave-requests'] || [];
+    const quota = many['quota-approval-history'] || [];
+    const notifs = many['pharmacist-notifications'] || [];
+    log(`Read: ${master.length} pharmacists, ${(cfg.dates||[]).length} training days, ` +
+        `${Object.keys(ops.assignments||{}).length} assignments, ${Object.keys(ops.attendance||{}).length} attendance, ` +
+        `${pending.length} pending, ${leave.length} leave, ${quota.length} quota-history, ${notifs.length} notifications.`);
+
+    /* ---------- build full record maps (bypass the diff — send everything) ---------- */
+    const masterRecs = toMap(master);
+    const dayRecs = toMap(cfg.dates || []);
+    const cfgSettings = {}; Object.keys(cfg).forEach(k => { if(k !== 'dates' && cfg[k] !== undefined) cfgSettings[k] = cfg[k]; });
+    const opRecs = {};
+    new Set([...Object.keys(ops.assignments||{}), ...Object.keys(ops.attendance||{})]).forEach(pid => {
+      const r = {}; if(ops.assignments[pid]) r.a = ops.assignments[pid]; if(ops.attendance[pid]) r.t = ops.attendance[pid];
+      if(Object.keys(r).length) opRecs[pid] = r;
+    });
+
+    /* ---------- WRITE to Supabase (pharmacists first, then everything that references them) ---------- */
+    useBackend(SB);
+    API.clearToken();
+    log('Signing in to Supabase…');
+    await API.login(user, pass);
+
+    async function push(key, records, settings){
+      const parts = chunks(records, 200);
+      if(!parts.length && settings) { await API.call('patch', {key, records:{}, settings}); log(`  ${key}: settings only ✓`); return; }
+      let done = 0;
+      for(let i=0;i<parts.length;i++){
+        await API.call('patch', {key, records: parts[i], settings: (i===0 && settings) ? settings : {}});
+        done += Object.keys(parts[i]).length;
+        log(`  ${key}: ${done}/${Object.keys(records).length}`);
+      }
+      if(!parts.length) log(`  ${key}: nothing to send`);
+    }
+
+    log('Uploading pharmacists…');            await push('master-pharmacists', masterRecs);
+    log('Uploading training days + settings…'); await push('training-config', dayRecs, cfgSettings);
+    log('Uploading assignments + attendance…'); await push('operations', opRecs);
+    log('Uploading pending pharmacists…');     await push('pending-pharmacists', toMap(pending));
+    log('Uploading leave requests…');          await push('leave-requests', toMap(leave));
+    log('Uploading quota history…');           await push('quota-approval-history', toMap(quota));
+    log('Uploading notifications…');           await push('pharmacist-notifications', toMap(notifs));
+    if(logo){ log('Uploading company logo…');  await API.call('patch', {key:'company-logo', records:{}, settings:{logo}}); }
+
+    log('\n✅ Migration complete. Now test with  trainer.html?backend=supabase');
+  }catch(e){
+    console.error(e);
+    log('\n❌ Error: ' + (e && e.message ? e.message : e));
+  }finally{
+    btn.disabled = false;
+  }
+}
+</script>
+</body>
+</html>
